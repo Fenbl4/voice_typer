@@ -1,0 +1,8 @@
+customtkinter>=5.2.0
+PyAudio>=0.2.14
+pynput>=1.7.6
+google-genai>=1.63.0
+pyperclip>=1.9.0
+PyAutoGUI>=0.9.54
+pystray>=0.19.5
+Pillow>=10.0

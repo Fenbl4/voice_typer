@@ -1,0 +1,6 @@
+dist/settings.json
+dist/history.json
+dist/debug.log
+build/
+*.spec
+__pycache__/
