@@ -1,0 +1,8 @@
+VoiceTyper v1.1: model fallback, clipboard fix, Cyrillic prompt
+
+- Auto-fallback: при 429/500 сразу пробует следующую модель из списка
+- Clipboard save/restore: Win32 API с 5 retry + pyperclip fallback
+- System instruction: явное требование Cyrillic для русского/украинского
+- Обновлённые модели: gemini-3-flash-preview, 2.5-flash, 2.5-flash-lite
+- Удалены deprecated модели 2.0
+- Обновлён README с описанием всех изменений

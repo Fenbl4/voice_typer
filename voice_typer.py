@@ -40,9 +40,9 @@ from google.genai import types as genai_types
 # =============================================================================
 
 AVAILABLE_MODELS = [
-    "gemini-3-flash-preview",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
+    "gemini-3-flash-preview",   # Gemini 3 Flash (newest, preview)
+    "gemini-2.5-flash",        # Gemini 2.5 Flash (stable, default)
+    "gemini-2.5-flash-lite",   # Gemini 2.5 Flash Lite (lightweight)
 ]
 DEFAULT_MODEL = "gemini-2.5-flash"
 
@@ -67,7 +67,9 @@ BASE_SYSTEM_INSTRUCTION = (
     "You are a professional transcriber. Transcribe the provided audio with perfect "
     "grammar and punctuation. Output ONLY the raw transcribed text — no quotes, no "
     "explanations, no markdown formatting, no commentary. Fix obvious speech errors. "
-    "Preserve the original language of the speaker."
+    "Preserve the original language of the speaker. "
+    "IMPORTANT: Always use the native script of the language — Russian and Ukrainian "
+    "must be in Cyrillic, never transliterate to Latin characters."
 )
 
 VAD_SPEECH_THRESHOLD = 300
@@ -367,6 +369,10 @@ def _get_window_title(user32, hwnd) -> str:
 KEYEVENTF_KEYUP = 0x0002
 VK_CONTROL = 0x11
 VK_V = 0x56
+
+# Clipboard Win32 constants
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
 
 
 # =============================================================================
@@ -1008,6 +1014,9 @@ class VoiceTyperApp:
         self._ui_lang = lang
 
         model = data.get("model", DEFAULT_MODEL)
+        # Миграция старых имён моделей
+        if model == "gemini-3-flash":
+            model = "gemini-3-flash-preview"
         if model in AVAILABLE_MODELS:
             self.model_var.set(model)
             self._model = model
@@ -1249,57 +1258,84 @@ class VoiceTyperApp:
             wf.writeframes(b"".join(self.audio_frames))
         audio_bytes = buf.getvalue()
 
-        MAX_RETRIES = 5
-        RETRY_BASE = 5    # начальная задержка (секунд)
-        RETRY_CAP = 30    # максимальная задержка (секунд)
+        # Стратегия: при 429/500 — сразу пробуем следующую модель из списка.
+        # Только после того как все модели дали 429 — ждём и пробуем снова.
+        MAX_ROUNDS = 2  # сколько раз пройти по всем моделям
+        ROUND_DELAY = 10  # пауза между раундами (секунд)
         text = None
         self._cancel_retry.clear()
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                response = self.client.models.generate_content(
-                    model=self._model,
-                    contents=[
-                        genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
-                        "Transcribe this audio.",
-                    ],
-                    config=genai_types.GenerateContentConfig(
-                        system_instruction=BASE_SYSTEM_INSTRUCTION,
-                    ),
-                )
-                text = response.text.strip()
-                # Устанавливаем cooldown только после УСПЕШНОГО вызова
-                self._cooldown_until = time.time() + MIN_API_INTERVAL
+        
+        # Начинаем с текущей модели, потом fallback на остальные
+        models_to_try = list(AVAILABLE_MODELS)
+        current_idx = 0
+        for i, m in enumerate(models_to_try):
+            if m == self._model:
+                current_idx = i
                 break
-            except Exception as e:
-                err = str(e)[:200]
-                self._log("error", f"API attempt {attempt}/{MAX_RETRIES}: {err}")
-                if "429" not in err or attempt == MAX_RETRIES:
-                    # Не 429 или исчерпаны попытки — показываем ошибку и сразу в Ready
-                    self._ui(lambda: self._set_status("status_api_error", "#F44336"))
-                    self.root.after(2500, lambda: self._ui(
-                        lambda: self._set_status("status_ready", "#4CAF50", tray_state="idle")
-                    ))
-                    return
-                # 429 — экспоненциальный backoff: 5 → 10 → 20 → 30 → 30
-                delay = min(RETRY_BASE * (2 ** (attempt - 1)), RETRY_CAP)
-                self._log("info", f"429 — retry {attempt+1}/{MAX_RETRIES} in {delay}s")
-                cancelled = False
-                for remaining in range(delay, 0, -1):
+        # Ротируем: текущая модель первой, потом остальные по порядку
+        models_to_try = models_to_try[current_idx:] + models_to_try[:current_idx]
+        
+        for round_num in range(MAX_ROUNDS):
+            if round_num > 0:
+                # Между раундами — пауза
+                self._log("info", f"All models exhausted, waiting {ROUND_DELAY}s before round {round_num+1}")
+                for remaining in range(ROUND_DELAY, 0, -1):
                     if self._cancel_retry.is_set():
                         self._log("info", "Retry cancelled by user")
                         self._ui(lambda: self._set_status(
                             "status_cancelled", "#FF9800", tray_state="idle"))
-                        cancelled = True
-                        break
-                    n, a, m = remaining, attempt + 1, MAX_RETRIES
-                    self._ui(lambda n=n, a=a, m=m: self._set_status(
+                        return
+                    n = remaining
+                    self._ui(lambda n=n: self._set_status(
                         "status_retry", "#FF9800", tray_state="processing",
-                        attempt=a, n=n, max=m,
+                        attempt=round_num+1, n=n, max=MAX_ROUNDS,
                     ))
                     time.sleep(1)
-                if cancelled:
+
+            for model_name in models_to_try:
+                if self._cancel_retry.is_set():
+                    self._log("info", "Retry cancelled by user")
+                    self._ui(lambda: self._set_status(
+                        "status_cancelled", "#FF9800", tray_state="idle"))
                     return
-        if text is None:
+                try:
+                    self._log("info", f"Trying model: {model_name}")
+                    response = self.client.models.generate_content(
+                        model=model_name,
+                        contents=[
+                            genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
+                            "Transcribe this audio.",
+                        ],
+                        config=genai_types.GenerateContentConfig(
+                            system_instruction=BASE_SYSTEM_INSTRUCTION,
+                        ),
+                    )
+                    text = response.text.strip()
+                    # Устанавливаем cooldown только после УСПЕШНОГО вызова
+                    self._cooldown_until = time.time() + MIN_API_INTERVAL
+                    if model_name != self._model:
+                        self._log("info", f"Fallback succeeded on {model_name}")
+                    break
+                except Exception as e:
+                    err = str(e)[:200]
+                    self._log("error", f"API error ({model_name}): {err}")
+                    if "429" in err or "500" in err:
+                        # Rate limit или server error — пробуем следующую модель
+                        continue
+                    else:
+                        # Другая ошибка (404, auth, etc.) — пропускаем эту модель
+                        continue
+            else:
+                # Все модели в этом раунде не сработали
+                continue
+            break  # Успешно получили текст
+        else:
+            # Все раунды исчерпаны
+            self._log("error", "All models exhausted after all rounds")
+            self._ui(lambda: self._set_status("status_api_error", "#F44336"))
+            self.root.after(2500, lambda: self._ui(
+                lambda: self._set_status("status_ready", "#4CAF50", tray_state="idle")
+            ))
             return
 
         if not text:
@@ -1312,8 +1348,76 @@ class VoiceTyperApp:
         hwnd = self._target_hwnd
         self.root.after(0, lambda: self._paste_pipeline(text, hwnd))
 
+    def _get_clipboard_text(self) -> str | None:
+        """Прочитать текст из clipboard через Win32 API (main thread)."""
+        kernel32 = ctypes.windll.kernel32
+        user32 = self._user32
+        # Retry: clipboard может быть заблокирован другим процессом
+        for retry in range(5):
+            try:
+                if not user32.OpenClipboard(0):
+                    time.sleep(0.05)
+                    continue
+                h = user32.GetClipboardData(CF_UNICODETEXT)
+                if not h:
+                    user32.CloseClipboard()
+                    return ""  # Clipboard открыт но пуст — возвращаем пустую строку
+                p = kernel32.GlobalLock(h)
+                if not p:
+                    user32.CloseClipboard()
+                    return ""
+                text = ctypes.wstring_at(p)
+                kernel32.GlobalUnlock(h)
+                user32.CloseClipboard()
+                return text
+            except Exception:
+                try:
+                    user32.CloseClipboard()
+                except Exception:
+                    pass
+                time.sleep(0.05)
+        # Win32 не смог — fallback на pyperclip
+        try:
+            return pyperclip.paste()
+        except Exception:
+            return None
+
+    def _restore_clipboard(self, text: str):
+        """Восстановить оригинальный текст в clipboard через Win32 API."""
+        kernel32 = ctypes.windll.kernel32
+        user32 = self._user32
+        try:
+            if not user32.OpenClipboard(0):
+                self._log("warn", "Restore clipboard: OpenClipboard failed")
+                return
+            user32.EmptyClipboard()
+            encoded = text.encode("utf-16-le") + b"\x00\x00"
+            h = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(encoded))
+            if not h:
+                user32.CloseClipboard()
+                return
+            p = kernel32.GlobalLock(h)
+            if not p:
+                kernel32.GlobalFree(h)
+                user32.CloseClipboard()
+                return
+            ctypes.memmove(p, encoded, len(encoded))
+            kernel32.GlobalUnlock(h)
+            user32.SetClipboardData(CF_UNICODETEXT, h)
+            user32.CloseClipboard()
+            self._log("info", f"Clipboard restored: {len(text)} chars")
+        except Exception as e:
+            self._log("error", f"Restore clipboard failed: {e}")
+            try:
+                user32.CloseClipboard()
+            except Exception:
+                pass
+
     def _paste_pipeline(self, text, hwnd):
         user32 = self._user32
+        # Сохраняем оригинальный буфер обмена (None = clipboard пуст или не текст)
+        original_clipboard = self._get_clipboard_text()
+        self._log("info", f"Saved clipboard: {len(original_clipboard) if original_clipboard is not None else 'None'} chars")
         try:
             pyperclip.copy(text)
             self._log("info", "Clipboard: OK")
@@ -1332,14 +1436,14 @@ class VoiceTyperApp:
             if current_fg != hwnd:
                 result = user32.SetForegroundWindow(hwnd)
                 self._log("info", f"SetForegroundWindow: {'OK' if result else 'FAIL'}")
-                self.root.after(150, lambda: self._send_paste_keys(hwnd))
+                self.root.after(150, lambda: self._send_paste_keys(hwnd, original_clipboard))
                 return
         else:
             self._log("info", "No specific target, pasting to current foreground")
 
-        self.root.after(50, lambda: self._send_paste_keys(hwnd))
+        self.root.after(50, lambda: self._send_paste_keys(hwnd, original_clipboard))
 
-    def _send_paste_keys(self, hwnd):
+    def _send_paste_keys(self, hwnd, original_clipboard=None):
         user32 = self._user32
         fg = user32.GetForegroundWindow()
         fg_title = _get_window_title(user32, fg)
@@ -1351,6 +1455,9 @@ class VoiceTyperApp:
         user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
 
         self._log("info", "Ctrl+V sent")
+        # Восстанавливаем оригинальный буфер через 300ms (дать время Ctrl+V отработать)
+        if original_clipboard is not None:
+            self.root.after(300, lambda: self._restore_clipboard(original_clipboard))
         # Pasted — иконка остаётся оранжевой во время cooldown
         self._set_status("status_pasted", "#4CAF50", tray_state="processing")
         self.root.after(1500, self._cooldown_tick)
