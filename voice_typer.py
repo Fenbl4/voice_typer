@@ -76,8 +76,8 @@ VAD_SPEECH_THRESHOLD = 300
 VAD_SILENCE_TIMEOUT = 1.5
 VAD_MIN_SPEECH_DURATION = 0.3
 
-# Gemini free tier: 15 RPM → 6s between requests to be safe
-MIN_API_INTERVAL = 6.0
+# Gemini free tier: no cooldown (was 6.0s)
+MIN_API_INTERVAL = 0
 
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.02
@@ -1458,9 +1458,9 @@ class VoiceTyperApp:
         # Восстанавливаем оригинальный буфер через 300ms (дать время Ctrl+V отработать)
         if original_clipboard is not None:
             self.root.after(300, lambda: self._restore_clipboard(original_clipboard))
-        # Pasted — иконка остаётся оранжевой во время cooldown
-        self._set_status("status_pasted", "#4CAF50", tray_state="processing")
-        self.root.after(1500, self._cooldown_tick)
+        # Pasted — кратко показываем статус, затем Ready
+        self._set_status("status_pasted", "#4CAF50", tray_state="idle")
+        self.root.after(1500, lambda: self._set_status("status_ready", "#4CAF50", tray_state="idle"))
 
     def _cooldown_tick(self):
         remaining = self._cooldown_until - time.time()
