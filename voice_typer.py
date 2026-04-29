@@ -34,17 +34,37 @@ from pynput import keyboard
 from google import genai
 from google.genai import types as genai_types
 
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+    Groq = None
+
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
-AVAILABLE_MODELS = [
+AVAILABLE_PROVIDERS = ["Gemini", "Groq"]
+DEFAULT_PROVIDER = "Gemini"
+
+GEMINI_MODELS = [
     "gemini-3-flash-preview",   # Gemini 3 Flash (newest, preview)
     "gemini-2.5-flash",        # Gemini 2.5 Flash (stable, default)
     "gemini-2.5-flash-lite",   # Gemini 2.5 Flash Lite (lightweight)
 ]
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
+GROQ_MODELS = [
+    "whisper-large-v3-turbo",  # $0.04/hr — fast + high quality (default)
+    "whisper-large-v3",        # $0.111/hr — max quality
+]
+DEFAULT_GROQ_MODEL = "whisper-large-v3-turbo"
+
+# Legacy aliases для обратной совместимости
+AVAILABLE_MODELS = GEMINI_MODELS
+DEFAULT_MODEL = DEFAULT_GEMINI_MODEL
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -88,11 +108,12 @@ pyautogui.PAUSE = 0.02
 
 UI_STRINGS = {
     "English": {
-        "subtitle": "Powered by Google Gemini",
+        "subtitle": "AI voice transcription",
         "api_key_lbl": "API Key:",
         "paste_btn": "Paste", "show_btn": "Show", "hide_btn": "Hide",
         "settings_lbl": "Settings",
         "mode_lbl": "Mode:",
+        "provider_lbl": "Provider:",
         "model_lbl": "Model:",
         "hotkey_lbl": "Hotkey:", "hotkey_change": "⌨ Change",
         "language_lbl": "Language:",
@@ -119,11 +140,12 @@ UI_STRINGS = {
         "no_logs": "No logs yet. Errors will appear here.",
     },
     "Russian": {
-        "subtitle": "На базе Google Gemini",
+        "subtitle": "ИИ голосовой ввод",
         "api_key_lbl": "API ключ:",
         "paste_btn": "Вставить", "show_btn": "Показать", "hide_btn": "Скрыть",
         "settings_lbl": "Настройки",
         "mode_lbl": "Режим:",
+        "provider_lbl": "Провайдер:",
         "model_lbl": "Модель:",
         "hotkey_lbl": "Хоткей:", "hotkey_change": "⌨ Изменить",
         "language_lbl": "Язык:",
@@ -150,11 +172,12 @@ UI_STRINGS = {
         "no_logs": "Логов пока нет.",
     },
     "Ukrainian": {
-        "subtitle": "На базі Google Gemini",
+        "subtitle": "ШІ голосовий ввід",
         "api_key_lbl": "API ключ:",
         "paste_btn": "Вставити", "show_btn": "Показати", "hide_btn": "Приховати",
         "settings_lbl": "Налаштування",
         "mode_lbl": "Режим:",
+        "provider_lbl": "Провайдер:",
         "model_lbl": "Модель:",
         "hotkey_lbl": "Хоткей:", "hotkey_change": "⌨ Змінити",
         "language_lbl": "Мова:",
@@ -387,7 +410,6 @@ class VoiceTyperApp:
         self._processing_lock = threading.Lock()
         self.audio_frames: list[bytes] = []
         self.stream = None
-        self.client = None
         self._target_hwnd = None
         self._cooldown_until = 0.0
         self._user32 = ctypes.windll.user32
@@ -396,7 +418,15 @@ class VoiceTyperApp:
         self._vad_stop = threading.Event()
         self._cancel_retry = threading.Event()
         self._vad_thread = None
-        self._model = DEFAULT_MODEL
+
+        # Провайдеры транскрипции — Gemini и Groq хранятся независимо
+        self._provider = DEFAULT_PROVIDER
+        self._gemini_client = None
+        self._groq_client = None
+        self._gemini_api_key = ""
+        self._groq_api_key = ""
+        self._gemini_model = DEFAULT_GEMINI_MODEL
+        self._groq_model = DEFAULT_GROQ_MODEL
 
         # Hotkey state
         self._hotkey_key = keyboard.Key.f8
@@ -508,6 +538,7 @@ class VoiceTyperApp:
         self._btn_toggle.configure(text=self._s("hide_btn" if self._key_visible else "show_btn"))
         self._lbl_settings.configure(text=self._s("settings_lbl"))
         self._lbl_mode.configure(text=self._s("mode_lbl"))
+        self._lbl_provider.configure(text=self._s("provider_lbl"))
         self._lbl_model.configure(text=self._s("model_lbl"))
         self._lbl_hotkey.configure(text=self._s("hotkey_lbl"))
         self.hotkey_capture_btn.configure(text=self._s("hotkey_change"))
@@ -586,17 +617,30 @@ class VoiceTyperApp:
             command=self._on_mode_changed,
         ).pack(side="left")
 
-        # Model
+        # Provider (Gemini / Groq)
+        r_provider = ctk.CTkFrame(sf, fg_color="transparent")
+        r_provider.pack(fill="x", padx=12, pady=(0, 4))
+        self._lbl_provider = ctk.CTkLabel(r_provider, text=self._s("provider_lbl"), width=100, anchor="w")
+        self._lbl_provider.pack(side="left")
+        self.provider_var = ctk.StringVar(value=DEFAULT_PROVIDER)
+        ctk.CTkOptionMenu(
+            r_provider, variable=self.provider_var,
+            values=AVAILABLE_PROVIDERS, width=160,
+            command=self._on_provider_changed,
+        ).pack(side="left")
+
+        # Model (список зависит от провайдера — меняется через _on_provider_changed)
         r_model = ctk.CTkFrame(sf, fg_color="transparent")
         r_model.pack(fill="x", padx=12, pady=(0, 4))
         self._lbl_model = ctk.CTkLabel(r_model, text=self._s("model_lbl"), width=100, anchor="w")
         self._lbl_model.pack(side="left")
-        self.model_var = ctk.StringVar(value=DEFAULT_MODEL)
-        ctk.CTkOptionMenu(
+        self.model_var = ctk.StringVar(value=DEFAULT_GEMINI_MODEL)
+        self._model_menu = ctk.CTkOptionMenu(
             r_model, variable=self.model_var,
-            values=AVAILABLE_MODELS, width=220,
+            values=GEMINI_MODELS, width=220,
             command=self._on_model_changed,
-        ).pack(side="left")
+        )
+        self._model_menu.pack(side="left")
 
         # Hotkey — capture-режим
         self.hotkey_row = ctk.CTkFrame(sf, fg_color="transparent")
@@ -828,8 +872,32 @@ class VoiceTyperApp:
         self._btn_toggle.configure(text=self._s("hide_btn" if self._key_visible else "show_btn"))
 
     def _on_model_changed(self, value):
-        self._model = value
-        self._log("info", f"Model changed to: {value}")
+        if self._provider == "Groq":
+            self._groq_model = value
+        else:
+            self._gemini_model = value
+        self._log("info", f"{self._provider} model changed to: {value}")
+        self._auto_save()
+
+    def _on_provider_changed(self, value):
+        self._provider = value
+        self._log("info", f"Provider changed to: {value}")
+        if value == "Groq":
+            self._model_menu.configure(values=GROQ_MODELS)
+            self.model_var.set(self._groq_model)
+            self.api_key_var.set(self._groq_api_key)
+            self.api_key_entry.configure(placeholder_text="Paste your Groq API key (gsk_...)")
+        else:
+            self._model_menu.configure(values=GEMINI_MODELS)
+            self.model_var.set(self._gemini_model)
+            self.api_key_var.set(self._gemini_api_key)
+            self.api_key_entry.configure(placeholder_text="Paste your Gemini API key (AIza...)")
+        # Статус: если активный провайдер сконфигурирован — Ready, иначе — нужен ключ
+        active_client = self._groq_client if value == "Groq" else self._gemini_client
+        if active_client:
+            self._set_status("status_ready", "#4CAF50")
+        else:
+            self._set_status("status_api_key", "#F44336")
         self._auto_save()
 
     def _on_mode_changed(self, value):
@@ -856,7 +924,12 @@ class VoiceTyperApp:
     def _on_api_key_changed(self, event):
         api_key = self.api_key_var.get().strip()
         if api_key:
-            self._configure_gemini(api_key)
+            if self._provider == "Groq":
+                self._groq_api_key = api_key
+                self._configure_groq(api_key)
+            else:
+                self._gemini_api_key = api_key
+                self._configure_gemini(api_key)
             self._set_status("status_ready", "#4CAF50")
         self._auto_save()
 
@@ -864,11 +937,14 @@ class VoiceTyperApp:
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump({
-                    "api_key": self.api_key_var.get().strip(),
+                    "provider": self.provider_var.get(),
+                    "gemini_api_key": self._gemini_api_key,
+                    "groq_api_key": self._groq_api_key,
+                    "gemini_model": self._gemini_model,
+                    "groq_model": self._groq_model,
                     "hotkey": self.hotkey_var.get(),
                     "language": self.language_var.get(),
                     "mode": self.mode_var.get(),
-                    "model": self.model_var.get(),
                 }, f, indent=2)
         except IOError:
             pass
@@ -998,9 +1074,43 @@ class VoiceTyperApp:
             except (json.JSONDecodeError, IOError):
                 pass
 
-        api_key = data.get("api_key", "")
-        if api_key:
-            self.api_key_var.set(api_key)
+        # Миграция старого формата: api_key → gemini_api_key, model → gemini_model
+        if "api_key" in data and "gemini_api_key" not in data:
+            data["gemini_api_key"] = data.pop("api_key")
+        if "model" in data and "gemini_model" not in data:
+            data["gemini_model"] = data.pop("model")
+
+        self._gemini_api_key = data.get("gemini_api_key", "")
+        self._groq_api_key = data.get("groq_api_key", "")
+
+        # Миграция старых имён моделей Gemini
+        gemini_model = data.get("gemini_model", DEFAULT_GEMINI_MODEL)
+        if gemini_model == "gemini-3-flash":
+            gemini_model = "gemini-3-flash-preview"
+        if gemini_model in GEMINI_MODELS:
+            self._gemini_model = gemini_model
+
+        groq_model = data.get("groq_model", DEFAULT_GROQ_MODEL)
+        if groq_model in GROQ_MODELS:
+            self._groq_model = groq_model
+
+        provider = data.get("provider", DEFAULT_PROVIDER)
+        if provider not in AVAILABLE_PROVIDERS:
+            provider = DEFAULT_PROVIDER
+        self._provider = provider
+        self.provider_var.set(provider)
+
+        # Подставить ключ/модель/placeholder активного провайдера в UI
+        if provider == "Groq":
+            self.api_key_var.set(self._groq_api_key)
+            self._model_menu.configure(values=GROQ_MODELS)
+            self.model_var.set(self._groq_model)
+            self.api_key_entry.configure(placeholder_text="Paste your Groq API key (gsk_...)")
+        else:
+            self.api_key_var.set(self._gemini_api_key)
+            self._model_menu.configure(values=GEMINI_MODELS)
+            self.model_var.set(self._gemini_model)
+            self.api_key_entry.configure(placeholder_text="Paste your Gemini API key (AIza...)")
 
         hotkey_str = data.get("hotkey", "F8")
         self._hotkey_key, self._hotkey_modifiers = _parse_hotkey_str(hotkey_str)
@@ -1013,14 +1123,6 @@ class VoiceTyperApp:
         self.language_var.set(lang)
         self._ui_lang = lang
 
-        model = data.get("model", DEFAULT_MODEL)
-        # Миграция старых имён моделей
-        if model == "gemini-3-flash":
-            model = "gemini-3-flash-preview"
-        if model in AVAILABLE_MODELS:
-            self.model_var.set(model)
-            self._model = model
-
         mode = data.get("mode", "Push-to-Talk")
         if mode in ("Push-to-Talk", "Voice Activated"):
             self.mode_var.set(mode)
@@ -1029,15 +1131,36 @@ class VoiceTyperApp:
         self.autostart_var.set(_is_autostart_enabled())
         self._on_mode_changed(self._mode)
 
-        if api_key:
-            self._configure_gemini(api_key)
+        # Конфигурируем оба клиента если ключи есть — пользователь может переключаться между ними
+        if self._gemini_api_key:
+            self._configure_gemini(self._gemini_api_key)
+        if self._groq_api_key:
+            self._configure_groq(self._groq_api_key)
+
+        active_client = self._groq_client if provider == "Groq" else self._gemini_client
+        if active_client:
             self._set_status("status_ready", "#4CAF50")
 
         self._apply_ui_language()
         self._update_hint()
 
     def _configure_gemini(self, api_key: str):
-        self.client = genai.Client(api_key=api_key)
+        try:
+            self._gemini_client = genai.Client(api_key=api_key)
+        except Exception as e:
+            self._log("error", f"Gemini configure failed: {e}")
+            self._gemini_client = None
+
+    def _configure_groq(self, api_key: str):
+        if not GROQ_AVAILABLE:
+            self._log("error", "groq package not installed — run: pip install groq")
+            self._groq_client = None
+            return
+        try:
+            self._groq_client = Groq(api_key=api_key)
+        except Exception as e:
+            self._log("error", f"Groq configure failed: {e}")
+            self._groq_client = None
 
     # =====================================================================
     # Mode switching
@@ -1246,7 +1369,9 @@ class VoiceTyperApp:
         if not self.audio_frames:
             self._ui(lambda: self._set_status("status_no_audio", "#FF9800"))
             return
-        if not self.client:
+
+        active_client = self._groq_client if self._provider == "Groq" else self._gemini_client
+        if not active_client:
             self._ui(lambda: self._set_status("status_api_key", "#F44336"))
             return
 
@@ -1258,33 +1383,47 @@ class VoiceTyperApp:
             wf.writeframes(b"".join(self.audio_frames))
         audio_bytes = buf.getvalue()
 
-        # Стратегия: при 429/500 — сразу пробуем следующую модель из списка.
-        # Только после того как все модели дали 429 — ждём и пробуем снова.
-        MAX_ROUNDS = 2  # сколько раз пройти по всем моделям
-        ROUND_DELAY = 10  # пауза между раундами (секунд)
-        text = None
+        if self._provider == "Groq":
+            text = self._call_groq(audio_bytes)
+        else:
+            text = self._call_gemini(audio_bytes)
+
+        if text is None:
+            return  # Статус уже установлен внутри _call_* (cancelled / api_error)
+
+        if not text:
+            self._ui(lambda: self._set_status("status_empty", "#FF9800"))
+            return
+
+        self._save_history_entry(text)
+        self._log("info", f"Transcribed ({self._provider}) {len(text)} chars: '{text[:60]}'")
+
+        hwnd = self._target_hwnd
+        self.root.after(0, lambda: self._paste_pipeline(text, hwnd))
+
+    def _call_gemini(self, audio_bytes: bytes):
+        """Транскрипция через Gemini с fallback по моделям. None = все упали."""
+        MAX_ROUNDS = 2
+        ROUND_DELAY = 10
         self._cancel_retry.clear()
-        
-        # Начинаем с текущей модели, потом fallback на остальные
-        models_to_try = list(AVAILABLE_MODELS)
+
+        models_to_try = list(GEMINI_MODELS)
         current_idx = 0
         for i, m in enumerate(models_to_try):
-            if m == self._model:
+            if m == self._gemini_model:
                 current_idx = i
                 break
-        # Ротируем: текущая модель первой, потом остальные по порядку
         models_to_try = models_to_try[current_idx:] + models_to_try[:current_idx]
-        
+
         for round_num in range(MAX_ROUNDS):
             if round_num > 0:
-                # Между раундами — пауза
-                self._log("info", f"All models exhausted, waiting {ROUND_DELAY}s before round {round_num+1}")
+                self._log("info", f"Gemini: all models exhausted, waiting {ROUND_DELAY}s before round {round_num+1}")
                 for remaining in range(ROUND_DELAY, 0, -1):
                     if self._cancel_retry.is_set():
                         self._log("info", "Retry cancelled by user")
                         self._ui(lambda: self._set_status(
                             "status_cancelled", "#FF9800", tray_state="idle"))
-                        return
+                        return None
                     n = remaining
                     self._ui(lambda n=n: self._set_status(
                         "status_retry", "#FF9800", tray_state="processing",
@@ -1297,10 +1436,10 @@ class VoiceTyperApp:
                     self._log("info", "Retry cancelled by user")
                     self._ui(lambda: self._set_status(
                         "status_cancelled", "#FF9800", tray_state="idle"))
-                    return
+                    return None
                 try:
-                    self._log("info", f"Trying model: {model_name}")
-                    response = self.client.models.generate_content(
+                    self._log("info", f"Trying Gemini model: {model_name}")
+                    response = self._gemini_client.models.generate_content(
                         model=model_name,
                         contents=[
                             genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
@@ -1311,42 +1450,80 @@ class VoiceTyperApp:
                         ),
                     )
                     text = response.text.strip()
-                    # Устанавливаем cooldown только после УСПЕШНОГО вызова
                     self._cooldown_until = time.time() + MIN_API_INTERVAL
-                    if model_name != self._model:
-                        self._log("info", f"Fallback succeeded on {model_name}")
-                    break
+                    if model_name != self._gemini_model:
+                        self._log("info", f"Gemini fallback succeeded on {model_name}")
+                    return text
                 except Exception as e:
                     err = str(e)[:200]
-                    self._log("error", f"API error ({model_name}): {err}")
-                    if "429" in err or "500" in err:
-                        # Rate limit или server error — пробуем следующую модель
-                        continue
+                    self._log("error", f"Gemini API error ({model_name}): {err}")
+                    continue
+
+        self._log("error", "All Gemini models exhausted after all rounds")
+        self._ui(lambda: self._set_status("status_api_error", "#F44336"))
+        self.root.after(2500, lambda: self._ui(
+            lambda: self._set_status("status_ready", "#4CAF50", tray_state="idle")))
+        return None
+
+    def _call_groq(self, audio_bytes: bytes):
+        """Транскрипция через Groq Whisper с fallback по моделям. None = все упали."""
+        MAX_ROUNDS = 2
+        ROUND_DELAY = 10
+        self._cancel_retry.clear()
+
+        models_to_try = list(GROQ_MODELS)
+        if self._groq_model in models_to_try:
+            idx = models_to_try.index(self._groq_model)
+            models_to_try = models_to_try[idx:] + models_to_try[:idx]
+
+        for round_num in range(MAX_ROUNDS):
+            if round_num > 0:
+                self._log("info", f"Groq: all models exhausted, waiting {ROUND_DELAY}s before round {round_num+1}")
+                for remaining in range(ROUND_DELAY, 0, -1):
+                    if self._cancel_retry.is_set():
+                        self._log("info", "Retry cancelled by user")
+                        self._ui(lambda: self._set_status(
+                            "status_cancelled", "#FF9800", tray_state="idle"))
+                        return None
+                    n = remaining
+                    self._ui(lambda n=n: self._set_status(
+                        "status_retry", "#FF9800", tray_state="processing",
+                        attempt=round_num+1, n=n, max=MAX_ROUNDS,
+                    ))
+                    time.sleep(1)
+
+            for model_name in models_to_try:
+                if self._cancel_retry.is_set():
+                    self._log("info", "Retry cancelled by user")
+                    self._ui(lambda: self._set_status(
+                        "status_cancelled", "#FF9800", tray_state="idle"))
+                    return None
+                try:
+                    self._log("info", f"Trying Groq model: {model_name}")
+                    response = self._groq_client.audio.transcriptions.create(
+                        file=("audio.wav", audio_bytes),
+                        model=model_name,
+                        response_format="text",
+                    )
+                    # Groq возвращает str для response_format="text", иначе object с .text
+                    if isinstance(response, str):
+                        text = response.strip()
                     else:
-                        # Другая ошибка (404, auth, etc.) — пропускаем эту модель
-                        continue
-            else:
-                # Все модели в этом раунде не сработали
-                continue
-            break  # Успешно получили текст
-        else:
-            # Все раунды исчерпаны
-            self._log("error", "All models exhausted after all rounds")
-            self._ui(lambda: self._set_status("status_api_error", "#F44336"))
-            self.root.after(2500, lambda: self._ui(
-                lambda: self._set_status("status_ready", "#4CAF50", tray_state="idle")
-            ))
-            return
+                        text = response.text.strip()
+                    self._cooldown_until = time.time() + MIN_API_INTERVAL
+                    if model_name != self._groq_model:
+                        self._log("info", f"Groq fallback succeeded on {model_name}")
+                    return text
+                except Exception as e:
+                    err = str(e)[:200]
+                    self._log("error", f"Groq API error ({model_name}): {err}")
+                    continue
 
-        if not text:
-            self._ui(lambda: self._set_status("status_empty", "#FF9800"))
-            return
-
-        self._save_history_entry(text)
-        self._log("info", f"Transcribed {len(text)} chars: '{text[:60]}'")
-
-        hwnd = self._target_hwnd
-        self.root.after(0, lambda: self._paste_pipeline(text, hwnd))
+        self._log("error", "All Groq models exhausted after all rounds")
+        self._ui(lambda: self._set_status("status_api_error", "#F44336"))
+        self.root.after(2500, lambda: self._ui(
+            lambda: self._set_status("status_ready", "#4CAF50", tray_state="idle")))
+        return None
 
     def _get_clipboard_text(self) -> str | None:
         """Прочитать текст из clipboard через Win32 API (main thread)."""
