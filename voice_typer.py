@@ -1,5 +1,5 @@
 """
-Voice Typer — AI-powered voice-to-text using Google Gemini.
+Voice Typer — fast local voice-to-text with optional cloud fallback.
 
 Two modes:
   Push-to-Talk: Hold hotkey to record, release to transcribe & paste.
@@ -17,6 +17,9 @@ import json
 import time
 import math
 import struct
+import re
+import hashlib
+import urllib.request
 import ctypes
 import ctypes.wintypes
 import winreg
@@ -41,13 +44,45 @@ except ImportError:
     GROQ_AVAILABLE = False
     Groq = None
 
+try:
+    import numpy as np
+    import onnx_asr
+    LOCAL_ASR_AVAILABLE = True
+except ImportError:
+    np = None
+    onnx_asr = None
+    LOCAL_ASR_AVAILABLE = False
+
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
-AVAILABLE_PROVIDERS = ["Gemini", "Groq"]
-DEFAULT_PROVIDER = "Gemini"
+LOCAL_PROVIDER = "Local"
+AVAILABLE_PROVIDERS = [LOCAL_PROVIDER, "Groq", "Gemini"]
+DEFAULT_PROVIDER = LOCAL_PROVIDER
+LOCAL_MODEL_NAME = "gigaam-v3-e2e-rnnt"
+LOCAL_MODEL_LABEL = "GigaAM v3 E2E RNN-T (RU)"
+LOCAL_MODEL_QUANTIZATION = "int8"
+LOCAL_DIRECT_MAX_SECONDS = 23.0
+LOCAL_MODEL_WAIT_SECONDS = 2.0
+SETTINGS_VERSION = 2
+
+LOCAL_MODEL_REPO = "istupakov/gigaam-v3-onnx"
+LOCAL_MODEL_REVISION = "322c3b29492673eb7d0b434bfa9dfb8653e34d02"
+LOCAL_MODEL_FILES = {
+    "config.json": "0641fcf73f4af791c73f05083e38a658ff5dcbee3534a0c61396c10f4b97f0fe",
+    "v3_e2e_rnnt_decoder.int8.onnx": "89014e134865615b91e037157e46e389b1271e6072460efc010ea08e61e23146",
+    "v3_e2e_rnnt_encoder.int8.onnx": "4e0e076a6076cd110277e529b8ac8f32cd5297f7fbebad5341ae8ddb7d00817b",
+    "v3_e2e_rnnt_joint.int8.onnx": "ade116563dbf66e503b0994efab6b5861412743e52bf31c39fc3fffa3783d5d1",
+    "v3_e2e_rnnt_vocab.txt": "39abae20e692998290c574e606f11a9edef2902a1995463fcff63d1490cf22b7",
+}
+LOCAL_VAD_REPO = "istupakov/silero-vad-onnx"
+LOCAL_VAD_REVISION = "b3e3ee3cce4c11ceb63b1a0b229d916069c1ddf6"
+LOCAL_VAD_FILES = {
+    "config.json": "1094039d370c82889582ba739a3d1caac5754c8b3a17a66a534200c9f72086e2",
+    "silero_vad.onnx": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
+}
 
 GEMINI_MODELS = [
     "gemini-3-flash-preview",   # Gemini 3 Flash (newest, preview)
@@ -82,6 +117,9 @@ SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
 HISTORY_FILE = os.path.join(APP_DIR, "history.json")
 APP_NAME = "VoiceTyper"
 WINDOW_TITLE = "Voice Typer"
+LOCAL_DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", APP_DIR), APP_NAME)
+LOCAL_MODEL_DIR = os.path.join(LOCAL_DATA_DIR, "models", LOCAL_MODEL_NAME)
+LOCAL_VAD_DIR = os.path.join(LOCAL_DATA_DIR, "models", "silero-vad")
 
 BASE_SYSTEM_INSTRUCTION = (
     "You are a professional transcriber. Transcribe the provided audio with perfect "
@@ -95,6 +133,13 @@ BASE_SYSTEM_INSTRUCTION = (
 VAD_SPEECH_THRESHOLD = 300
 VAD_SILENCE_TIMEOUT = 1.5
 VAD_MIN_SPEECH_DURATION = 0.3
+
+GROQ_HALLUCINATION_TAILS = (
+    "продолжение следует",
+    "спасибо за просмотр",
+    "субтитры сделал",
+    "субтитры делал",
+)
 
 # Gemini free tier: no cooldown (was 6.0s)
 MIN_API_INTERVAL = 0
@@ -135,6 +180,10 @@ UI_STRINGS = {
         "status_retry": "Retry {attempt}/{max} in {n}s...",
         "status_cancelled": "Cancelled — record again",
         "status_wait": "Please wait...",
+        "status_model_loading": "Preparing local speech model...",
+        "status_model_error": "Local speech model error",
+        "status_fallback": "Local model unavailable. Using {provider}...",
+        "local_key_hint": "No API key needed",
         "capture_prompt": "Press keys...",
         "no_history": "No transcriptions yet.",
         "no_logs": "No logs yet. Errors will appear here.",
@@ -167,6 +216,10 @@ UI_STRINGS = {
         "status_retry": "Повтор {attempt}/{max} через {n}с...",
         "status_cancelled": "Отменено — запиши снова",
         "status_wait": "Подождите...",
+        "status_model_loading": "Подготовка локальной модели...",
+        "status_model_error": "Ошибка локальной модели",
+        "status_fallback": "Локальная модель недоступна. Используется {provider}...",
+        "local_key_hint": "API ключ не нужен",
         "capture_prompt": "Нажмите...",
         "no_history": "Записей пока нет.",
         "no_logs": "Логов пока нет.",
@@ -199,6 +252,10 @@ UI_STRINGS = {
         "status_retry": "Повтор {attempt}/{max} через {n}с...",
         "status_cancelled": "Скасовано — запиши знову",
         "status_wait": "Зачекайте...",
+        "status_model_loading": "Підготовка локальної моделі...",
+        "status_model_error": "Помилка локальної моделі",
+        "status_fallback": "Локальна модель недоступна. Використовується {provider}...",
+        "local_key_hint": "API ключ не потрібен",
         "capture_prompt": "Натисніть...",
         "no_history": "Записів поки немає.",
         "no_logs": "Логів поки немає.",
@@ -348,6 +405,54 @@ def _rms(data: bytes) -> float:
     return math.sqrt(sum(s * s for s in shorts) / count)
 
 
+def _trim_pcm_silence(pcm_bytes: bytes) -> bytes:
+    """Обрезать только крайние тишину и шум, сохранив небольшой запас вокруг речи."""
+    if not pcm_bytes or np is None:
+        return pcm_bytes
+
+    samples = np.frombuffer(pcm_bytes, dtype="<i2")
+    if samples.size < int(SAMPLE_RATE * 0.15):
+        return b""
+
+    frame_samples = int(SAMPLE_RATE * 0.02)
+    frame_count = (samples.size + frame_samples - 1) // frame_samples
+    padded = np.pad(samples, (0, frame_count * frame_samples - samples.size))
+    frames = padded.reshape(frame_count, frame_samples).astype(np.float32)
+    levels = np.sqrt(np.mean(frames * frames, axis=1))
+
+    noise_floor = float(np.percentile(levels, 20))
+    threshold = max(90.0, min(350.0, noise_floor * 2.5))
+    active = np.flatnonzero(levels >= threshold)
+    if active.size == 0:
+        return b""
+
+    lead_padding = int(SAMPLE_RATE * 0.12)
+    tail_padding = int(SAMPLE_RATE * 0.18)
+    start = max(0, int(active[0]) * frame_samples - lead_padding)
+    end = min(samples.size, (int(active[-1]) + 1) * frame_samples + tail_padding)
+    return samples[start:end].tobytes()
+
+
+def _clean_transcript(text: str, provider: str) -> str:
+    """Нормализовать пробелы и убрать только известную отдельную концовку Whisper."""
+    cleaned = re.sub(r"[\t\r\n ]+", " ", text or "").strip()
+    if provider != "Groq" or not cleaned:
+        return cleaned
+
+    for phrase in GROQ_HALLUCINATION_TAILS:
+        pattern = rf"(?:^|(?<=[.!?…]))\s*{re.escape(phrase)}[.!?…]*$"
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE).rstrip()
+    return cleaned
+
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _is_autostart_enabled() -> bool:
     try:
         key = winreg.OpenKey(
@@ -417,7 +522,19 @@ class VoiceTyperApp:
         self._tray_icon = None
         self._vad_stop = threading.Event()
         self._cancel_retry = threading.Event()
+        self._shutdown = threading.Event()
         self._vad_thread = None
+        self._record_thread = None
+
+        # Локальная модель грузится один раз и остаётся в памяти между диктовками.
+        self._local_model = None
+        self._local_vad_model = None
+        self._local_long_model = None
+        self._local_state = "not_started"
+        self._local_error = ""
+        self._local_ready = threading.Event()
+        self._local_load_thread = None
+        self._local_state_lock = threading.Lock()
 
         # Провайдеры транскрипции — Gemini и Groq хранятся независимо
         self._provider = DEFAULT_PROVIDER
@@ -438,6 +555,7 @@ class VoiceTyperApp:
         self._ui_lang = "English"
         self._mode = "Push-to-Talk"
         self._status_key = "status_ready"
+        self._status_fmt = {}
 
         # History
         self._history: list[dict] = []
@@ -470,6 +588,8 @@ class VoiceTyperApp:
         self._load_settings()
         self._apply_mode()
         self._start_tray()
+        if self._provider == LOCAL_PROVIDER:
+            self._start_local_model_load()
 
         self.root.withdraw()
 
@@ -503,12 +623,15 @@ class VoiceTyperApp:
         self.root.withdraw()
 
     def _quit_app(self):
+        self._shutdown.set()
         self._vad_stop.set()
         self.is_recording = False
         if self._listener:
             self._listener.stop()
         if self._vad_thread and self._vad_thread.is_alive():
             self._vad_thread.join(timeout=2)
+        if self._record_thread and self._record_thread.is_alive():
+            self._record_thread.join(timeout=2)
         if self.stream:
             try:
                 self.stream.stop_stream()
@@ -546,12 +669,14 @@ class VoiceTyperApp:
         self._chk_autostart.configure(text=self._s("autostart_chk"))
         self._btn_history.configure(text=self._s("history_btn"))
         self._btn_logs.configure(text=self._s("logs_btn"))
+        if self._provider == LOCAL_PROVIDER:
+            self.api_key_entry.configure(placeholder_text=self._s("local_key_hint"))
         self._update_hint()
         self._refresh_status()
 
     def _refresh_status(self):
         """Обновить статус-лейбл при смене языка."""
-        text = self._s(self._status_key)
+        text = self._s(self._status_key, **self._status_fmt)
         self.status_label.configure(text=text)
 
     # =====================================================================
@@ -579,7 +704,7 @@ class VoiceTyperApp:
         self.api_key_var = ctk.StringVar()
         self.api_key_entry = ctk.CTkEntry(
             key_frame, textvariable=self.api_key_var, show="*",
-            placeholder_text="Paste your Gemini API key",
+            placeholder_text=self._s("local_key_hint"), state="disabled",
         )
         self.api_key_entry.pack(side="left", fill="x", expand=True, pady=8)
         self.api_key_entry.bind("<FocusOut>", self._on_api_key_changed)
@@ -634,10 +759,10 @@ class VoiceTyperApp:
         r_model.pack(fill="x", padx=12, pady=(0, 4))
         self._lbl_model = ctk.CTkLabel(r_model, text=self._s("model_lbl"), width=100, anchor="w")
         self._lbl_model.pack(side="left")
-        self.model_var = ctk.StringVar(value=DEFAULT_GEMINI_MODEL)
+        self.model_var = ctk.StringVar(value=LOCAL_MODEL_LABEL)
         self._model_menu = ctk.CTkOptionMenu(
             r_model, variable=self.model_var,
-            values=GEMINI_MODELS, width=220,
+            values=[LOCAL_MODEL_LABEL], width=220,
             command=self._on_model_changed,
         )
         self._model_menu.pack(side="left")
@@ -872,6 +997,8 @@ class VoiceTyperApp:
         self._btn_toggle.configure(text=self._s("hide_btn" if self._key_visible else "show_btn"))
 
     def _on_model_changed(self, value):
+        if self._provider == LOCAL_PROVIDER:
+            return
         if self._provider == "Groq":
             self._groq_model = value
         else:
@@ -882,23 +1009,48 @@ class VoiceTyperApp:
     def _on_provider_changed(self, value):
         self._provider = value
         self._log("info", f"Provider changed to: {value}")
-        if value == "Groq":
+        self._apply_provider_ui()
+        if value == LOCAL_PROVIDER:
+            self._start_local_model_load()
+        self._auto_save()
+
+    def _apply_provider_ui(self):
+        if self._provider == LOCAL_PROVIDER:
+            self._model_menu.configure(values=[LOCAL_MODEL_LABEL])
+            self.model_var.set(LOCAL_MODEL_LABEL)
+            self.api_key_var.set("")
+            self.api_key_entry.configure(
+                state="disabled", placeholder_text=self._s("local_key_hint")
+            )
+            self._btn_paste.configure(state="disabled")
+            self._btn_toggle.configure(state="disabled")
+            if self._local_state == "ready":
+                self._set_status("status_ready", "#4CAF50")
+            elif self._local_state == "failed":
+                self._set_status("status_model_error", "#F44336")
+            else:
+                self._set_status("status_model_loading", "#FF9800", tray_state="processing")
+            return
+
+        self.api_key_entry.configure(state="normal")
+        self._btn_paste.configure(state="normal")
+        self._btn_toggle.configure(state="normal")
+        if self._provider == "Groq":
             self._model_menu.configure(values=GROQ_MODELS)
             self.model_var.set(self._groq_model)
             self.api_key_var.set(self._groq_api_key)
             self.api_key_entry.configure(placeholder_text="Paste your Groq API key (gsk_...)")
+            active_client = self._groq_client
         else:
             self._model_menu.configure(values=GEMINI_MODELS)
             self.model_var.set(self._gemini_model)
             self.api_key_var.set(self._gemini_api_key)
             self.api_key_entry.configure(placeholder_text="Paste your Gemini API key (AIza...)")
-        # Статус: если активный провайдер сконфигурирован — Ready, иначе — нужен ключ
-        active_client = self._groq_client if value == "Groq" else self._gemini_client
+            active_client = self._gemini_client
         if active_client:
             self._set_status("status_ready", "#4CAF50")
         else:
             self._set_status("status_api_key", "#F44336")
-        self._auto_save()
 
     def _on_mode_changed(self, value):
         if value == "Voice Activated":
@@ -922,6 +1074,8 @@ class VoiceTyperApp:
         self._auto_save()
 
     def _on_api_key_changed(self, event):
+        if self._provider == LOCAL_PROVIDER:
+            return
         api_key = self.api_key_var.get().strip()
         if api_key:
             if self._provider == "Groq":
@@ -937,6 +1091,7 @@ class VoiceTyperApp:
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump({
+                    "settings_version": SETTINGS_VERSION,
                     "provider": self.provider_var.get(),
                     "gemini_api_key": self._gemini_api_key,
                     "groq_api_key": self._groq_api_key,
@@ -963,6 +1118,7 @@ class VoiceTyperApp:
     def _set_status(self, key: str, color: str = "gray", tray_state: str = None, **fmt):
         """Установить статус по ключу локализации."""
         self._status_key = key
+        self._status_fmt = dict(fmt)
         text = self._s(key, **fmt)
         self.status_label.configure(text=text, text_color=color)
         # Определяем состояние трея
@@ -1094,23 +1250,20 @@ class VoiceTyperApp:
         if groq_model in GROQ_MODELS:
             self._groq_model = groq_model
 
+        try:
+            settings_version = int(data.get("settings_version", 0))
+        except (TypeError, ValueError):
+            settings_version = 0
+
         provider = data.get("provider", DEFAULT_PROVIDER)
         if provider not in AVAILABLE_PROVIDERS:
             provider = DEFAULT_PROVIDER
+        # Однократный переход старых установок на бесплатный локальный движок.
+        if settings_version < SETTINGS_VERSION:
+            provider = LOCAL_PROVIDER
         self._provider = provider
         self.provider_var.set(provider)
-
-        # Подставить ключ/модель/placeholder активного провайдера в UI
-        if provider == "Groq":
-            self.api_key_var.set(self._groq_api_key)
-            self._model_menu.configure(values=GROQ_MODELS)
-            self.model_var.set(self._groq_model)
-            self.api_key_entry.configure(placeholder_text="Paste your Groq API key (gsk_...)")
-        else:
-            self.api_key_var.set(self._gemini_api_key)
-            self._model_menu.configure(values=GEMINI_MODELS)
-            self.model_var.set(self._gemini_model)
-            self.api_key_entry.configure(placeholder_text="Paste your Gemini API key (AIza...)")
+        self._apply_provider_ui()
 
         hotkey_str = data.get("hotkey", "F8")
         self._hotkey_key, self._hotkey_modifiers = _parse_hotkey_str(hotkey_str)
@@ -1138,7 +1291,7 @@ class VoiceTyperApp:
             self._configure_groq(self._groq_api_key)
 
         active_client = self._groq_client if provider == "Groq" else self._gemini_client
-        if active_client:
+        if provider != LOCAL_PROVIDER and active_client:
             self._set_status("status_ready", "#4CAF50")
 
         self._apply_ui_language()
@@ -1161,6 +1314,133 @@ class VoiceTyperApp:
         except Exception as e:
             self._log("error", f"Groq configure failed: {e}")
             self._groq_client = None
+
+    # =====================================================================
+    # Local GigaAM model
+    # =====================================================================
+
+    def _start_local_model_load(self):
+        with self._local_state_lock:
+            if self._local_state in ("loading", "ready"):
+                return
+            self._local_state = "loading"
+            self._local_error = ""
+            self._local_ready.clear()
+
+        if self._provider == LOCAL_PROVIDER:
+            self._set_status("status_model_loading", "#FF9800", tray_state="processing")
+        self._local_load_thread = threading.Thread(
+            target=self._load_local_model,
+            name="VoiceTyperLocalModel",
+            daemon=True,
+        )
+        self._local_load_thread.start()
+
+    def _ensure_local_model_files(self, directory, repo, revision, files):
+        os.makedirs(directory, exist_ok=True)
+        for filename, expected_hash in files.items():
+            target = os.path.join(directory, filename)
+            if os.path.isfile(target) and _file_sha256(target) == expected_hash:
+                continue
+            if self._shutdown.is_set():
+                raise RuntimeError("application is shutting down")
+
+            temp_path = target + ".download"
+            url = f"https://huggingface.co/{repo}/resolve/{revision}/{filename}?download=true"
+            self._log("info", f"Downloading local model file: {filename}")
+            try:
+                request = urllib.request.Request(url, headers={"User-Agent": "VoiceTyper/2"})
+                with urllib.request.urlopen(request, timeout=60) as response, open(temp_path, "wb") as output:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        if self._shutdown.is_set():
+                            raise RuntimeError("application is shutting down")
+                        output.write(chunk)
+
+                actual_hash = _file_sha256(temp_path)
+                if actual_hash != expected_hash:
+                    raise RuntimeError(f"checksum mismatch for {filename}")
+                os.replace(temp_path, target)
+            finally:
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+
+    def _load_local_model(self):
+        if not LOCAL_ASR_AVAILABLE:
+            self._finish_local_model_error("onnx-asr or numpy package is not installed")
+            return
+
+        started = time.perf_counter()
+        try:
+            self._ensure_local_model_files(
+                LOCAL_MODEL_DIR,
+                LOCAL_MODEL_REPO,
+                LOCAL_MODEL_REVISION,
+                LOCAL_MODEL_FILES,
+            )
+            model = onnx_asr.load_model(
+                LOCAL_MODEL_NAME,
+                LOCAL_MODEL_DIR,
+                quantization=LOCAL_MODEL_QUANTIZATION,
+                providers=["CPUExecutionProvider"],
+            )
+
+            long_model = None
+            vad_model = None
+            try:
+                self._ensure_local_model_files(
+                    LOCAL_VAD_DIR,
+                    LOCAL_VAD_REPO,
+                    LOCAL_VAD_REVISION,
+                    LOCAL_VAD_FILES,
+                )
+                vad_model = onnx_asr.load_vad(
+                    "silero",
+                    LOCAL_VAD_DIR,
+                    providers=["CPUExecutionProvider"],
+                )
+                long_model = model.with_vad(
+                    vad_model,
+                    max_speech_duration_s=22.0,
+                    min_speech_duration_ms=250.0,
+                    min_silence_duration_ms=300.0,
+                    speech_pad_ms=120.0,
+                )
+            except Exception as e:
+                self._log("warn", f"Local VAD unavailable: {str(e)[:300]}")
+
+            if self._shutdown.is_set():
+                return
+            with self._local_state_lock:
+                self._local_model = model
+                self._local_vad_model = vad_model
+                self._local_long_model = long_model
+                self._local_state = "ready"
+                self._local_error = ""
+                self._local_ready.set()
+
+            elapsed = time.perf_counter() - started
+            self._log("info", f"Local GigaAM ready in {elapsed:.2f}s")
+            if not self._shutdown.is_set():
+                self._ui(lambda: self._set_status("status_ready", "#4CAF50")
+                         if self._provider == LOCAL_PROVIDER else None)
+        except Exception as e:
+            self._finish_local_model_error(str(e))
+
+    def _finish_local_model_error(self, error: str):
+        with self._local_state_lock:
+            self._local_state = "failed"
+            self._local_error = error[:500]
+            self._local_ready.set()
+        self._log("error", f"Local GigaAM load failed: {error[:500]}")
+        if not self._shutdown.is_set():
+            self._ui(lambda: self._set_status("status_model_error", "#F44336")
+                     if self._provider == LOCAL_PROVIDER else None)
 
     # =====================================================================
     # Mode switching
@@ -1228,7 +1508,12 @@ class VoiceTyperApp:
         self._key_held = True
         self.is_recording = True
         self.audio_frames = []
-        threading.Thread(target=self._record_loop, daemon=True).start()
+        self._record_thread = threading.Thread(
+            target=self._record_loop,
+            name="VoiceTyperRecording",
+            daemon=True,
+        )
+        self._record_thread.start()
         self._ui(lambda: self._set_status("status_recording", "#F44336"))
 
     def _on_key_release(self, key):
@@ -1240,7 +1525,11 @@ class VoiceTyperApp:
         self._key_held = False
         self.is_recording = False
         self._ui(lambda: self._set_status("status_processing", "#FF9800"))
-        threading.Thread(target=self._process_and_paste, daemon=True).start()
+        threading.Thread(
+            target=lambda: self._process_and_paste(wait_for_recording=True),
+            name="VoiceTyperProcessing",
+            daemon=True,
+        ).start()
 
     # =====================================================================
     # Voice Activated (VAD)
@@ -1311,9 +1600,7 @@ class VoiceTyperApp:
                                     f_copy = frames[:]
                                     h_copy = target_hwnd
                                     def _process(frames_=f_copy, hwnd_=h_copy):
-                                        self._target_hwnd = hwnd_
-                                        self.audio_frames = frames_
-                                        self._process_and_paste()
+                                        self._process_and_paste(frames=frames_, hwnd=hwnd_)
                                     self._ui(lambda: self._set_status("status_processing", "#FF9800"))
                                     threading.Thread(target=_process, daemon=True).start()
                             else:
@@ -1356,23 +1643,37 @@ class VoiceTyperApp:
     # Transcription & paste
     # =====================================================================
 
-    def _process_and_paste(self):
+    def _process_and_paste(self, frames=None, hwnd=None, wait_for_recording=False):
         if not self._processing_lock.acquire(blocking=False):
             self._log("warn", "Skipped: already processing")
             return
         try:
-            self._do_transcribe()
+            if wait_for_recording:
+                record_thread = self._record_thread
+                if record_thread and record_thread is not threading.current_thread():
+                    record_thread.join(timeout=2)
+                    if record_thread.is_alive():
+                        self._log("warn", "Recording thread did not stop before transcription")
+            frames_to_process = list(self.audio_frames if frames is None else frames)
+            target_hwnd = self._target_hwnd if hwnd is None else hwnd
+            self._do_transcribe(frames_to_process, target_hwnd)
         finally:
             self._processing_lock.release()
 
-    def _do_transcribe(self):
-        if not self.audio_frames:
+    def _do_transcribe(self, frames, target_hwnd):
+        if not frames:
             self._ui(lambda: self._set_status("status_no_audio", "#FF9800"))
             return
 
-        active_client = self._groq_client if self._provider == "Groq" else self._gemini_client
-        if not active_client:
+        provider = self._provider
+        active_client = self._groq_client if provider == "Groq" else self._gemini_client
+        if provider != LOCAL_PROVIDER and not active_client:
             self._ui(lambda: self._set_status("status_api_key", "#F44336"))
+            return
+
+        pcm_bytes = _trim_pcm_silence(b"".join(frames))
+        if not pcm_bytes:
+            self._ui(lambda: self._set_status("status_no_audio", "#FF9800"))
             return
 
         buf = io.BytesIO()
@@ -1380,10 +1681,23 @@ class VoiceTyperApp:
             wf.setnchannels(CHANNELS)
             wf.setsampwidth(self.audio.get_sample_size(AUDIO_FORMAT))
             wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(b"".join(self.audio_frames))
+            wf.writeframes(pcm_bytes)
         audio_bytes = buf.getvalue()
 
-        if self._provider == "Groq":
+        actual_provider = provider
+        if provider == LOCAL_PROVIDER:
+            text = self._call_local(pcm_bytes)
+            if text is None:
+                actual_provider, text = self._call_online_fallback(audio_bytes)
+                if text is None:
+                    if self._local_state == "loading":
+                        self._ui(lambda: self._set_status(
+                            "status_model_loading", "#FF9800", tray_state="processing"
+                        ))
+                    else:
+                        self._ui(lambda: self._set_status("status_model_error", "#F44336"))
+                    return
+        elif provider == "Groq":
             text = self._call_groq(audio_bytes)
         else:
             text = self._call_gemini(audio_bytes)
@@ -1391,15 +1705,64 @@ class VoiceTyperApp:
         if text is None:
             return  # Статус уже установлен внутри _call_* (cancelled / api_error)
 
+        text = _clean_transcript(text, actual_provider)
         if not text:
             self._ui(lambda: self._set_status("status_empty", "#FF9800"))
             return
 
         self._save_history_entry(text)
-        self._log("info", f"Transcribed ({self._provider}) {len(text)} chars: '{text[:60]}'")
+        self._log("info", f"Transcribed ({actual_provider}) {len(text)} chars: '{text[:60]}'")
 
-        hwnd = self._target_hwnd
-        self.root.after(0, lambda: self._paste_pipeline(text, hwnd))
+        self.root.after(0, lambda: self._paste_pipeline(text, target_hwnd))
+
+    def _call_local(self, pcm_bytes: bytes):
+        """Локальное распознавание. None означает, что нужен запасной провайдер."""
+        if self._local_state == "not_started":
+            self._ui(self._start_local_model_load)
+        if self._local_state != "ready":
+            self._local_ready.wait(timeout=LOCAL_MODEL_WAIT_SECONDS)
+        if self._local_state != "ready" or self._local_model is None:
+            self._log("warn", f"Local GigaAM unavailable, state={self._local_state}")
+            return None
+
+        try:
+            waveform = np.frombuffer(pcm_bytes, dtype="<i2").astype(np.float32) / 32768.0
+            duration = waveform.size / SAMPLE_RATE
+            started = time.perf_counter()
+            if duration <= LOCAL_DIRECT_MAX_SECONDS:
+                text = self._local_model.recognize(waveform, sample_rate=SAMPLE_RATE)
+                segment_count = 1
+            else:
+                if self._local_long_model is None:
+                    self._log("warn", "Local VAD unavailable for long transcription")
+                    return None
+                segments = list(self._local_long_model.recognize(waveform, sample_rate=SAMPLE_RATE))
+                text = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
+                segment_count = len(segments)
+            elapsed = time.perf_counter() - started
+            self._log(
+                "info",
+                f"Local GigaAM: audio={duration:.2f}s asr={elapsed:.2f}s segments={segment_count}",
+            )
+            return str(text).strip()
+        except Exception as e:
+            self._log("error", f"Local GigaAM transcription failed: {str(e)[:500]}")
+            return None
+
+    def _call_online_fallback(self, audio_bytes: bytes):
+        if self._groq_client:
+            self._ui(lambda: self._set_status(
+                "status_fallback", "#FF9800", tray_state="processing", provider="Groq"
+            ))
+            self._log("warn", "Local GigaAM fallback to Groq")
+            return "Groq", self._call_groq(audio_bytes, language="ru")
+        if self._gemini_client:
+            self._ui(lambda: self._set_status(
+                "status_fallback", "#FF9800", tray_state="processing", provider="Gemini"
+            ))
+            self._log("warn", "Local GigaAM fallback to Gemini")
+            return "Gemini", self._call_gemini(audio_bytes)
+        return LOCAL_PROVIDER, None
 
     def _call_gemini(self, audio_bytes: bytes):
         """Транскрипция через Gemini с fallback по моделям. None = все упали."""
@@ -1465,7 +1828,7 @@ class VoiceTyperApp:
             lambda: self._set_status("status_ready", "#4CAF50", tray_state="idle")))
         return None
 
-    def _call_groq(self, audio_bytes: bytes):
+    def _call_groq(self, audio_bytes: bytes, language: str = None):
         """Транскрипция через Groq Whisper с fallback по моделям. None = все упали."""
         MAX_ROUNDS = 2
         ROUND_DELAY = 10
@@ -1500,10 +1863,16 @@ class VoiceTyperApp:
                     return None
                 try:
                     self._log("info", f"Trying Groq model: {model_name}")
+                    request = {
+                        "file": ("audio.wav", audio_bytes),
+                        "model": model_name,
+                        "response_format": "text",
+                        "temperature": 0,
+                    }
+                    if language:
+                        request["language"] = language
                     response = self._groq_client.audio.transcriptions.create(
-                        file=("audio.wav", audio_bytes),
-                        model=model_name,
-                        response_format="text",
+                        **request,
                     )
                     # Groq возвращает str для response_format="text", иначе object с .text
                     if isinstance(response, str):
