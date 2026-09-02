@@ -47,10 +47,12 @@ except ImportError:
 try:
     import numpy as np
     import onnx_asr
+    import onnxruntime as ort
     LOCAL_ASR_AVAILABLE = True
 except ImportError:
     np = None
     onnx_asr = None
+    ort = None
     LOCAL_ASR_AVAILABLE = False
 
 
@@ -66,6 +68,24 @@ LOCAL_MODEL_LABEL = "GigaAM v3 E2E RNN-T (RU)"
 LOCAL_MODEL_QUANTIZATION = "int8"
 LOCAL_DIRECT_MAX_SECONDS = 23.0
 LOCAL_MODEL_WAIT_SECONDS = 2.0
+# Замер 2026-09-02 на 340 с речи: 4 потока распознают так же быстро, как 8 (14.8 с против 15.5 с),
+# а без спин-ожидания свободные ядра не крутятся вхолостую между запусками модели.
+LOCAL_ASR_THREADS = 4
+LOCAL_VAD_OPTIONS = {
+    "max_speech_duration_s": 22.0,
+    "min_speech_duration_ms": 250.0,
+    "min_silence_duration_ms": 300.0,
+    "speech_pad_ms": 120.0,
+}
+# Живое распознавание во время записи Push-to-Talk: закрытые речевые отрезки распознаются,
+# пока клавиша ещё зажата, и после отпускания остаётся только хвост длиной до ~22 с.
+# Порог 20 с оставляет короткие записи целыми, как раньше: резать их незачем, а разрез на заминке
+# внутри слова давал обрывок («бу-у-у» вместо «будет», 2026-09-02).
+LIVE_MIN_PENDING_SECONDS = 20.0   # столько нераспознанного звука копится перед новой нарезкой
+LIVE_POLL_SECONDS = 0.5
+LIVE_MIN_GAP_SECONDS = 1.0        # пауза короче этой считается заминкой внутри фразы, а не границей
+LIVE_TAIL_GUARD_SECONDS = 1.0     # отрезок закрыт, если после него записано хотя бы столько звука
+LIVE_JOIN_TIMEOUT_SECONDS = 30.0
 SETTINGS_VERSION = 2
 
 LOCAL_MODEL_REPO = "istupakov/gigaam-v3-onnx"
@@ -433,6 +453,17 @@ def _trim_pcm_silence(pcm_bytes: bytes) -> bytes:
     return samples[start:end].tobytes()
 
 
+def _merge_close_segments(segments, min_gap: int, max_length: int) -> list:
+    """Склеить соседние речевые отрезки с паузой короче min_gap: заминка внутри слова не режет фразу."""
+    merged: list = []
+    for start, end in segments:
+        if merged and start - merged[-1][1] < min_gap and end - merged[-1][0] <= max_length:
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def _clean_transcript(text: str, provider: str) -> str:
     """Нормализовать пробелы и убрать только известную отдельную концовку Whisper."""
     cleaned = re.sub(r"[\t\r\n ]+", " ", text or "").strip()
@@ -507,6 +538,21 @@ GMEM_MOVEABLE = 0x0002
 # Application
 # =============================================================================
 
+class _LiveTranscription:
+    """Черновик распознавания, который копится во время записи Push-to-Talk."""
+
+    def __init__(self, frames: list):
+        self.frames = frames             # тот же список, куда пишет поток микрофона
+        self.texts: list[str] = []       # тексты закрытых отрезков по порядку записи
+        self.consumed_frames = 0         # сколько блоков с начала записи уже распознано
+        self.failed = False
+        self.stop = threading.Event()
+        self.thread = None
+
+    def usable(self) -> bool:
+        return not self.failed
+
+
 class VoiceTyperApp:
 
     def __init__(self):
@@ -525,6 +571,7 @@ class VoiceTyperApp:
         self._shutdown = threading.Event()
         self._vad_thread = None
         self._record_thread = None
+        self._live = None
 
         # Локальная модель грузится один раз и остаётся в памяти между диктовками.
         self._local_model = None
@@ -626,6 +673,8 @@ class VoiceTyperApp:
         self._shutdown.set()
         self._vad_stop.set()
         self.is_recording = False
+        if self._live:
+            self._live.stop.set()
         if self._listener:
             self._listener.stop()
         if self._vad_thread and self._vad_thread.is_alive():
@@ -1383,11 +1432,15 @@ class VoiceTyperApp:
                 LOCAL_MODEL_REVISION,
                 LOCAL_MODEL_FILES,
             )
+            session_options = ort.SessionOptions()
+            session_options.intra_op_num_threads = LOCAL_ASR_THREADS
+            session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
             model = onnx_asr.load_model(
                 LOCAL_MODEL_NAME,
                 LOCAL_MODEL_DIR,
                 quantization=LOCAL_MODEL_QUANTIZATION,
                 providers=["CPUExecutionProvider"],
+                sess_options=session_options,
             )
 
             long_model = None
@@ -1403,14 +1456,9 @@ class VoiceTyperApp:
                     "silero",
                     LOCAL_VAD_DIR,
                     providers=["CPUExecutionProvider"],
+                    sess_options=session_options,
                 )
-                long_model = model.with_vad(
-                    vad_model,
-                    max_speech_duration_s=22.0,
-                    min_speech_duration_ms=250.0,
-                    min_silence_duration_ms=300.0,
-                    speech_pad_ms=120.0,
-                )
+                long_model = model.with_vad(vad_model, **LOCAL_VAD_OPTIONS)
             except Exception as e:
                 self._log("warn", f"Local VAD unavailable: {str(e)[:300]}")
 
@@ -1514,6 +1562,7 @@ class VoiceTyperApp:
             daemon=True,
         )
         self._record_thread.start()
+        self._live = self._start_live_transcription(self.audio_frames)
         self._ui(lambda: self._set_status("status_recording", "#F44336"))
 
     def _on_key_release(self, key):
@@ -1524,9 +1573,10 @@ class VoiceTyperApp:
             return
         self._key_held = False
         self.is_recording = False
+        live, self._live = self._live, None
         self._ui(lambda: self._set_status("status_processing", "#FF9800"))
         threading.Thread(
-            target=lambda: self._process_and_paste(wait_for_recording=True),
+            target=lambda: self._process_and_paste(wait_for_recording=True, live=live),
             name="VoiceTyperProcessing",
             daemon=True,
         ).start()
@@ -1640,10 +1690,86 @@ class VoiceTyperApp:
                 self.stream = None
 
     # =====================================================================
+    # Live transcription during Push-to-Talk recording
+    # =====================================================================
+
+    def _start_live_transcription(self, frames: list):
+        """Запустить распознавание закрытых отрезков, пока клавиша ещё зажата. None = обычный путь."""
+        if self._provider != LOCAL_PROVIDER or np is None:
+            return None
+        if self._local_state != "ready" or self._local_model is None or self._local_vad_model is None:
+            return None
+        live = _LiveTranscription(frames)
+        live.thread = threading.Thread(
+            target=self._live_transcribe_loop,
+            args=(live,),
+            name="VoiceTyperLive",
+            daemon=True,
+        )
+        live.thread.start()
+        return live
+
+    def _live_transcribe_loop(self, live: "_LiveTranscription"):
+        try:
+            while not live.stop.wait(LIVE_POLL_SECONDS):
+                self._live_transcribe_step(live)
+        except Exception as e:
+            live.failed = True
+            self._log("error", f"Live transcription failed: {str(e)[:300]}")
+
+    def _local_speech_segments(self, waveform) -> list:
+        """Границы речевых отрезков (в отсчётах) по Silero VAD с теми же настройками, что у длинного пути."""
+        segments = self._local_vad_model.segment_batch(
+            waveform[None, :],
+            np.array([waveform.size], dtype=np.int64),
+            SAMPLE_RATE,
+            **LOCAL_VAD_OPTIONS,
+        )
+        return [(int(start), int(end)) for start, end in next(iter(segments))]
+
+    def _live_transcribe_step(self, live: "_LiveTranscription"):
+        """Распознать отрезки, после которых уже записана тишина; открытый хвост остаётся на потом."""
+        base = live.consumed_frames
+        pending = live.frames[base:len(live.frames)]
+        if not pending:
+            return
+        if sum(len(f) for f in pending) < int(LIVE_MIN_PENDING_SECONDS * SAMPLE_RATE) * 2:
+            return
+
+        waveform = np.frombuffer(b"".join(pending), dtype="<i2").astype(np.float32) / 32768.0
+        segments = _merge_close_segments(
+            self._local_speech_segments(waveform),
+            int(LIVE_MIN_GAP_SECONDS * SAMPLE_RATE),
+            int(LOCAL_VAD_OPTIONS["max_speech_duration_s"] * SAMPLE_RATE),
+        )
+        guard = int(LIVE_TAIL_GUARD_SECONDS * SAMPLE_RATE)
+        closed = [(s, e) for s, e in segments if e <= waveform.size - guard]
+        if not closed:
+            return
+
+        frame_ends = np.cumsum([len(f) for f in pending])  # байтовые границы блоков микрофона
+        started = time.perf_counter()
+        done = 0
+        for start, end in closed:
+            if live.stop.is_set():
+                break
+            text = str(self._local_model.recognize(waveform[start:end], sample_rate=SAMPLE_RATE)).strip()
+            if text:
+                live.texts.append(text)
+            live.consumed_frames = base + int(np.searchsorted(frame_ends, end * 2, side="right"))
+            done += 1
+        if done:
+            self._log(
+                "info",
+                f"Live: +{done} segments asr={time.perf_counter() - started:.2f}s "
+                f"consumed={live.consumed_frames * CHUNK_SIZE / SAMPLE_RATE:.1f}s texts={len(live.texts)}",
+            )
+
+    # =====================================================================
     # Transcription & paste
     # =====================================================================
 
-    def _process_and_paste(self, frames=None, hwnd=None, wait_for_recording=False):
+    def _process_and_paste(self, frames=None, hwnd=None, wait_for_recording=False, live=None):
         if not self._processing_lock.acquire(blocking=False):
             self._log("warn", "Skipped: already processing")
             return
@@ -1654,13 +1780,20 @@ class VoiceTyperApp:
                     record_thread.join(timeout=2)
                     if record_thread.is_alive():
                         self._log("warn", "Recording thread did not stop before transcription")
+            if live is not None:
+                live.stop.set()
+                if live.thread is not None and live.thread.is_alive():
+                    live.thread.join(timeout=LIVE_JOIN_TIMEOUT_SECONDS)
+                    if live.thread.is_alive():
+                        live.failed = True
+                        self._log("warn", "Live transcription did not stop, reprocessing whole recording")
             frames_to_process = list(self.audio_frames if frames is None else frames)
             target_hwnd = self._target_hwnd if hwnd is None else hwnd
-            self._do_transcribe(frames_to_process, target_hwnd)
+            self._do_transcribe(frames_to_process, target_hwnd, live)
         finally:
             self._processing_lock.release()
 
-    def _do_transcribe(self, frames, target_hwnd):
+    def _do_transcribe(self, frames, target_hwnd, live=None):
         if not frames:
             self._ui(lambda: self._set_status("status_no_audio", "#FF9800"))
             return
@@ -1671,9 +1804,24 @@ class VoiceTyperApp:
             self._ui(lambda: self._set_status("status_api_key", "#F44336"))
             return
 
-        pcm_bytes = _trim_pcm_silence(b"".join(frames))
+        # Всё, что живое распознавание уже закрыло во время записи, повторно не распознаётся.
+        prefix_text = ""
+        tail_frames = frames
+        if live is not None and live.usable() and live.consumed_frames > 0:
+            prefix_text = " ".join(live.texts)
+            tail_frames = frames[live.consumed_frames:]
+            self._log(
+                "info",
+                f"Live: {len(live.texts)} texts ready before release, "
+                f"tail={len(tail_frames) * CHUNK_SIZE / SAMPLE_RATE:.1f}s of {len(frames) * CHUNK_SIZE / SAMPLE_RATE:.1f}s",
+            )
+
+        pcm_bytes = _trim_pcm_silence(b"".join(tail_frames))
         if not pcm_bytes:
-            self._ui(lambda: self._set_status("status_no_audio", "#FF9800"))
+            if prefix_text:
+                self._finish_transcription(prefix_text, LOCAL_PROVIDER, target_hwnd)
+            else:
+                self._ui(lambda: self._set_status("status_no_audio", "#FF9800"))
             return
 
         buf = io.BytesIO()
@@ -1703,9 +1851,17 @@ class VoiceTyperApp:
             text = self._call_gemini(audio_bytes)
 
         if text is None:
-            return  # Статус уже установлен внутри _call_* (cancelled / api_error)
+            if not prefix_text:
+                return  # Статус уже установлен внутри _call_* (cancelled / api_error)
+            self._log("warn", "Tail transcription failed, pasting the live part only")
+            text = ""
 
         text = _clean_transcript(text, actual_provider)
+        if prefix_text:
+            text = f"{prefix_text} {text}".strip()
+        self._finish_transcription(text, actual_provider, target_hwnd)
+
+    def _finish_transcription(self, text: str, actual_provider: str, target_hwnd):
         if not text:
             self._ui(lambda: self._set_status("status_empty", "#FF9800"))
             return
